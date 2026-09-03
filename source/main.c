@@ -21,14 +21,25 @@
 static PrintConsole topScreen;
 static PrintConsole bottomScreen;
 
-#define DEFAULT_ROOT "/saves"
+// Tried in order when there is no config file. TWiLight Menu++ keeps DS saves
+// in /roms/nds/saves by default; the others cover the layouts people end up
+// with. Scanning is recursive, so the broader entries at the end also catch
+// saves sitting in sub-folders.
+static const char *const DEFAULT_ROOTS[] = {
+    "/roms/nds/saves",
+    "/saves",
+    "/roms/nds",
+    "/roms",
+};
+#define DEFAULT_ROOTS_COUNT ((int)(sizeof(DEFAULT_ROOTS) / sizeof(DEFAULT_ROOTS[0])))
 
 // Bounded so that root + '/' + a save name always fits in a SaveEntry's
 // base_path, otherwise a long root would silently truncate a path and we'd
 // end up reading or overwriting the wrong file.
 #define ROOT_PATH_MAX (SAVE_BASE_MAX - SAVE_NAME_MAX - 2)
 
-static char g_root[ROOT_PATH_MAX] = DEFAULT_ROOT;
+static char g_root[ROOT_PATH_MAX] = "";
+static bool g_root_from_config = false;
 static SaveEntry g_entries[MAX_SAVE_ENTRIES];
 static int g_entry_count = 0;
 
@@ -38,20 +49,55 @@ static void load_config(void)
     if (f == NULL)
         return;
 
-    if (fgets(g_root, sizeof(g_root), f) != NULL)
+    char line[ROOT_PATH_MAX];
+    if (fgets(line, sizeof(line), f) != NULL)
     {
-        size_t len = strlen(g_root);
-        while (len > 0 && (g_root[len - 1] == '\n' || g_root[len - 1] == '\r'))
-            g_root[--len] = '\0';
-        if (len == 0)
-            strcpy(g_root, DEFAULT_ROOT);
+        char *start = line;
+
+        // A file saved from Notepad starts with a UTF-8 BOM, which would
+        // otherwise become part of the path and make it unopenable.
+        if ((u8)start[0] == 0xEF && (u8)start[1] == 0xBB && (u8)start[2] == 0xBF)
+            start += 3;
+
+        while (*start == ' ' || *start == '\t')
+            start++;
+
+        size_t len = strlen(start);
+        while (len > 0 && (start[len - 1] == '\n' || start[len - 1] == '\r' ||
+                           start[len - 1] == ' '  || start[len - 1] == '\t'))
+            start[--len] = '\0';
+
+        if (len > 0)
+        {
+            snprintf(g_root, sizeof(g_root), "%s", start);
+            g_root_from_config = true;
+        }
     }
     fclose(f);
 }
 
 static void rescan(void)
 {
-    g_entry_count = scan_saves(g_root, g_entries, MAX_SAVE_ENTRIES);
+    if (g_root_from_config)
+    {
+        g_entry_count = scan_saves(g_root, g_entries, MAX_SAVE_ENTRIES);
+        return;
+    }
+
+    // No config file: try the usual places and keep the first one that
+    // actually holds saves, so a fresh card works with no setup at all.
+    for (int i = 0; i < DEFAULT_ROOTS_COUNT; i++)
+    {
+        g_entry_count = scan_saves(DEFAULT_ROOTS[i], g_entries, MAX_SAVE_ENTRIES);
+        if (g_entry_count > 0)
+        {
+            snprintf(g_root, sizeof(g_root), "%s", DEFAULT_ROOTS[i]);
+            return;
+        }
+    }
+
+    snprintf(g_root, sizeof(g_root), "%s", DEFAULT_ROOTS[0]);
+    g_entry_count = 0;
 }
 
 // Finds the entry the host announced. If this console doesn't have that game
@@ -76,6 +122,23 @@ static void resolve_entry(const char *name, SaveKind kind, SaveEntry *out, bool 
     *is_new = true;
 }
 
+// Nothing found is the one failure a user can't debug without being told
+// where we actually looked.
+static void print_where_we_looked(void)
+{
+    if (g_root_from_config)
+    {
+        printf("Dossier configure :\n  %s\n\n", g_root);
+        printf("Corrige le chemin dans\n/_nds/savesync/config.txt\n");
+        return;
+    }
+
+    printf("Dossiers essayes :\n");
+    for (int i = 0; i < DEFAULT_ROOTS_COUNT; i++)
+        printf("  %s\n", DEFAULT_ROOTS[i]);
+    printf("\nPour en imposer un autre,\ncree /_nds/savesync/config.txt\navec le chemin dedans.\n");
+}
+
 // Menu de choix du jeu, cote hote. `keep_link` maintient la session NiFi
 // pendant que l'utilisateur navigue. Renvoie -1 si B est presse.
 static int menu_pick_entry(bool keep_link)
@@ -97,11 +160,9 @@ static int menu_pick_entry(bool keep_link)
 
         if (g_entry_count == 0)
         {
-            printf("Aucune sauvegarde trouvee\n");
-            printf("dans %s\n\n", g_root);
-            printf("Verifie le chemin dans\n");
-            printf("/_nds/savesync/config.txt\n\n");
-            printf("B: retour\n");
+            printf("Aucune sauvegarde trouvee.\n\n");
+            print_where_we_looked();
+            printf("\nB: retour\n");
         }
 
         int first = sel - 3;
@@ -302,9 +363,15 @@ int main(int argc, char *argv[])
     load_config();
     rescan();
 
-    printf("Dossier : %s\n", g_root);
+    printf("Dossier : %s%s\n", g_root, g_root_from_config ? " (config)" : "");
     printf("%d sauvegarde(s) trouvee(s)\n", g_entry_count);
     printf("Paquet NiFi : %d octets\n", netsync_packet_size());
+
+    if (g_entry_count == 0)
+    {
+        printf("\n");
+        print_where_we_looked();
+    }
 
     while (1)
     {

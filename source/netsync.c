@@ -193,6 +193,26 @@ static bool decide_send(const SaveEntry *entry, const SyncMeta *a, const SyncMet
     return false;
 }
 
+// True only when there is real, irreconcilable disagreement: both consoles
+// already have actual content for the same sub-file, and it differs. This is
+// what decide_send() can't tell apart on its own -- from decide_send()'s
+// point of view, "peer has it and I don't yet" and "we both have it but it
+// diverged" look the same (presence or CRC differ at equal version), but
+// only the second one is a real conflict. The first is just a plain copy.
+static bool subfiles_really_disagree(const SaveEntry *entry, const SyncMeta *a,
+                                      const SyncMeta *b)
+{
+    int count;
+    const int *order = subfile_order(entry, &count);
+    for (int i = 0; i < count; i++)
+    {
+        int sf = order[i];
+        if (a->present[sf] && b->present[sf] && a->crc32[sf] != b->crc32[sf])
+            return true;
+    }
+    return false;
+}
+
 static void hex8(u32 v, char *out)
 {
     static const char digits[] = "0123456789ABCDEF";
@@ -795,8 +815,12 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
             ReceiveMode mode = RMODE_NONE;
             if (peer_sends)
             {
-                mode = (peer_meta.version > local_meta->version)
-                           ? RMODE_OVERWRITE : RMODE_CONFLICT;
+                if (peer_meta.version > local_meta->version)
+                    mode = RMODE_OVERWRITE;
+                else if (subfiles_really_disagree(entry, local_meta, &peer_meta))
+                    mode = RMODE_CONFLICT;
+                else
+                    mode = RMODE_OVERWRITE; // e.g. equal version, I just don't have it yet
             }
             receiver_start(&receiver, entry, mode, peer_sends);
             decided = true;

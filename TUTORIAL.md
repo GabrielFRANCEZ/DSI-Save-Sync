@@ -4,12 +4,17 @@ Homebrew `.nds` qui synchronise les sauvegardes entre deux DSi via NiFi
 (Wi-Fi local sans borne), lancé depuis TWiLight Menu++ / Unlaunch. Pas de
 serveur, pas d'infra : les deux consoles se parlent directement.
 
-**État.** Le ROM `savesync.nds` est compilé (BlocksDS 1.23.0, sans
-avertissement) et démarre correctement sous melonDS : il lit la carte SD,
-trouve les sauvegardes et affiche ses menus. Ce qui reste à valider : la
-découverte NiFi entre deux consoles, et surtout le transfert lui-même, qui
-n'a encore jamais tourné. **Ne le laisse pas toucher une vraie sauvegarde
-avant d'avoir fait un transfert réussi sur des fichiers factices.**
+**État : validé sur deux vraies DSi.** Détection des sauvegardes, découverte
+NiFi, connexion, choix du jeu par l'hôte et transfert complet ont tourné de
+bout en bout sur du matériel réel (BlocksDS 1.23.0, compilation sans
+avertissement).
+
+Ce qui reste non vérifié à ce jour : le cas DSiWare (paire `.pub`/`.prv`), le
+vrai conflit à deux contenus divergents, et le fait qu'un jeu relise sans
+broncher une sauvegarde reçue. Le CRC32 vérifié de bout en bout garantit que
+les octets arrivent intacts, mais tant qu'un jeu n'a pas rechargé une save
+transférée, **garde une copie de tes sauvegardes sur PC avant de synchroniser
+quelque chose d'irremplaçable.**
 
 ## 1. Ce que fait l'appli
 
@@ -19,17 +24,22 @@ avant d'avoir fait un transfert réussi sur des fichiers factices.**
   version incrémenté dès que le CRC32 du fichier change, plus l'ID de la
   console. Aucune décision ne dépend de l'horloge RTC, qui dérive entre
   consoles ([`source/savescan.c`](source/savescan.c)).
-- Tu choisis un jeu, puis "Héberger" sur une console et "Rejoindre" sur
-  l'autre. L'appli compare les versions :
+- **X** = Héberger sur une console, **Y** = Rejoindre sur l'autre. Une fois
+  connectées, c'est **l'hôte** qui choisit le jeu et annonce son nom au
+  client : c'est ce qui garantit que les deux comparent bien le même fichier.
+- L'appli compare ensuite les versions :
   - **versions différentes** → la plus récente écrase l'ancienne, l'ancienne
     étant d'abord copiée en `.bak` ;
-  - **versions égales, contenus différents** (vrai conflit) → rien n'est
-    écrasé : la copie de l'autre console arrive sous
-    `NomDuJeu.sav.conflict-XXXXXXXX`, à toi de trancher ;
+  - **une console a le fichier, l'autre pas** → simple copie, rien à trancher ;
+  - **versions égales et les deux ont un contenu qui diffère** (vrai conflit)
+    → rien n'est écrasé : la copie de l'autre console arrive sous
+    `NomDuJeu.sav.conflict-XXXXXXXX`, à toi de choisir ;
   - **identiques** → rien à faire.
-- Transfert par blocs de 200 octets avec accusé de réception, et vérification
+- Transfert par blocs de 128 octets avec accusé de réception, et vérification
   CRC32 de bout en bout avant tout remplacement
-  ([`source/netsync.c`](source/netsync.c)).
+  ([`source/netsync.c`](source/netsync.c)). La taille des blocs n'est pas
+  arbitraire : le matériel NDS n'a que 256 octets de tampon pour les trames
+  de réponse du client, en-têtes compris.
 
 ## 2. Compiler (déjà fait, pour rebuild après modification)
 
@@ -140,15 +150,26 @@ vérifie que les deux fenêtres viennent bien du **même** processus melonDS
 ## 4. Déployer sur les deux DSi
 
 1. Copie `savesync.nds` dans le dossier de homebrews de TWiLight Menu++ (par
-   ex. `/roms/nds/`) sur **les deux** cartes SD.
-2. Crée `/_nds/savesync/config.txt` sur les deux cartes, contenant le dossier
-   à scanner, par exemple :
-   ```
-   /roms
-   ```
-   Ajuste selon l'emplacement réel de tes sauvegardes (réglage des chemins
-   dans TWiLight Menu++).
+   ex. `/roms/nds/`) sur **les deux** cartes SD — voir l'avertissement en gras
+   ci-dessous.
+2. Aucune configuration n'est nécessaire : l'appli essaie `/roms/nds/saves`,
+   `/saves`, `/roms/nds` puis `/roms`, et garde le premier dossier qui
+   contient vraiment des sauvegardes. Le dossier retenu s'affiche au
+   démarrage.
+   Pour imposer un chemin, crée `/_nds/savesync/config.txt` avec ce chemin sur
+   une seule ligne, par exemple `/roms/nds/saves`.
 3. Sur chaque DSi : Unlaunch → TWiLight Menu++ → "DSi Save Sync".
+
+**Les deux cartes doivent avoir exactement le même `savesync.nds`.** Deux
+versions différentes se manifestent par un simple « connexion échouée » sans
+autre explication : la taille des paquets NiFi est fixée à l'ouverture de la
+session, donc une console restée sur une version antérieure n'entre pas en
+mode multijoueur et l'autre ne trouve jamais personne. En cas de doute,
+compare les empreintes depuis le PC :
+
+```bash
+md5sum /d/roms/nds/savesync.nds ~/projects/dsi-save-sync/savesync.nds
+```
 
 **Avant le premier essai sur du vrai matériel, fais une copie de la carte SD**
 (ou au moins du dossier de sauvegardes) sur ton PC. L'appli fait des `.bak`,
@@ -157,17 +178,37 @@ bug la contourne.
 
 ## 5. Utiliser
 
-1. HAUT/BAS pour naviguer, A pour choisir **le même jeu sur les deux
-   consoles**.
-2. **X** sur une console (héberge), **Y** sur l'autre (rejoint).
+1. **X** sur une console (héberge), **Y** sur l'autre (rejoint). Rien à
+   sélectionner avant : la session se crée d'abord.
+2. Une fois connectées, **l'hôte** choisit le jeu avec HAUT/BAS puis A. Le
+   client affiche le nom reçu et suit — il n'a rien à choisir, ce qui évite
+   que les deux consoles comparent deux fichiers différents.
 3. Résultat affiché : `DEJA A JOUR`, `ENVOYE`, `RECU`, `CONFLIT`,
    `PAS DE CONSOLE` ou `ERREUR`. B annule à tout moment sans rien écrire.
+
+Si l'hôte choisit un jeu que l'autre console n'a pas, elle affiche « absent
+ici, il sera copié » et le reçoit comme nouveau fichier.
 
 En cas de `CONFLIT`, les fichiers `.conflict-XXXXXXXX` se comparent depuis un
 PC avec un lecteur de carte SD ; remplace toi-même le `.sav` si tu veux garder
 la version de l'autre console.
 
-## 6. Limites connues
+## 6. Dépannage
+
+| Symptôme | Cause la plus probable |
+|---|---|
+| `CONNEXION ECHOUEE` systématique | Les deux cartes n'ont pas le même `savesync.nds` (voir §4) |
+| `Aucune sauvegarde trouvee` | L'appli liste à l'écran les dossiers qu'elle a essayés ; si le tien n'y est pas, force-le via `config.txt` |
+| `Paquet trop gros pour le NiFi` | Une modification a fait dépasser `SyncPkt` ; le `_Static_assert` de `netsync.c` devrait l'attraper à la compilation |
+| `Le Wi-Fi ne demarre pas` | Le changement de mode n'a pas abouti en 5 s ; relancer l'appli |
+| `L'autre console ne repond plus` | L'autre console a quitté la session ou s'est mise en veille |
+| Écran figé, B sans effet | Ne devrait plus arriver : toutes les attentes sont bornées et annulables. Si ça se reproduit, c'est un bug à signaler |
+
+Un `config.txt` écrit avec le Bloc-notes est géré (le BOM UTF-8 est ignoré),
+mais vérifie que Windows ne l'a pas nommé `config.txt.txt` avec les extensions
+masquées.
+
+## 7. Limites connues
 
 - Un jeu à la fois, synchronisation lancée à la main (pas d'intégration
   automatique au lancement d'un jeu depuis TWiLight Menu++, ce qui
@@ -176,3 +217,9 @@ la version de l'autre console.
   NiFi ; l'alternative serait un serveur Wi-Fi).
 - Un seul niveau de `.bak` : une deuxième synchro écrase la sauvegarde de
   secours précédente.
+- Environ 7 Ko/s (blocs de 128 octets, un par image) : compter une minute
+  pour une sauvegarde de 512 Ko. La marge sous la limite matérielle est
+  volontairement prudente et pourrait être remontée maintenant qu'un
+  transfert réel a abouti.
+- Le cas DSiWare (`.pub`/`.prv` transférés ensemble) est implémenté mais
+  n'a jamais été testé sur du vrai matériel.
