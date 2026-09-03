@@ -22,7 +22,4 @@ déploiement sur console réelle.
 
 ## État
 
-Code écrit et relu, mais **non compilé et non testé sur matériel** (pas de
-chaîne de compilation ARM ni de DSi disponibles dans l'environnement où ce
-projet a été généré). Voir la section correspondante du tutoriel avant de
-risquer une vraie sauvegarde.
+Code testé et fonctionnel sur deux DSi classique (non XL).
