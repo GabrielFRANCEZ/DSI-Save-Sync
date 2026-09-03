@@ -25,8 +25,9 @@ quelque chose d'irremplaçable.**
   console. Aucune décision ne dépend de l'horloge RTC, qui dérive entre
   consoles ([`source/savescan.c`](source/savescan.c)).
 - **X** = Héberger sur une console, **Y** = Rejoindre sur l'autre. Une fois
-  connectées, c'est **l'hôte** qui choisit le jeu et annonce son nom au
-  client : c'est ce qui garantit que les deux comparent bien le même fichier.
+  connectées, c'est **l'hôte** qui choisit une ou plusieurs sauvegardes et les
+  annonce au client une par une : c'est ce qui garantit que les deux comparent
+  bien le même fichier à chaque étape.
 - L'appli compare ensuite les versions :
   - **versions différentes** → la plus récente écrase l'ancienne, l'ancienne
     étant d'abord copiée en `.bak` ;
@@ -35,7 +36,7 @@ quelque chose d'irremplaçable.**
     → rien n'est écrasé : la copie de l'autre console arrive sous
     `NomDuJeu.sav.conflict-XXXXXXXX`, à toi de choisir ;
   - **identiques** → rien à faire.
-- Transfert par blocs de 128 octets avec accusé de réception, et vérification
+- Transfert par blocs de 160 octets avec accusé de réception, et vérification
   CRC32 de bout en bout avant tout remplacement
   ([`source/netsync.c`](source/netsync.c)). La taille des blocs n'est pas
   arbitraire : le matériel NDS n'a que 256 octets de tampon pour les trames
@@ -180,11 +181,17 @@ bug la contourne.
 
 1. **X** sur une console (héberge), **Y** sur l'autre (rejoint). Rien à
    sélectionner avant : la session se crée d'abord.
-2. Une fois connectées, **l'hôte** choisit le jeu avec HAUT/BAS puis A. Le
-   client affiche le nom reçu et suit — il n'a rien à choisir, ce qui évite
-   que les deux consoles comparent deux fichiers différents.
-3. Résultat affiché : `DEJA A JOUR`, `ENVOYE`, `RECU`, `CONFLIT`,
-   `PAS DE CONSOLE` ou `ERREUR`. B annule à tout moment sans rien écrire.
+2. Une fois connectées, **l'hôte** coche les sauvegardes voulues : HAUT/BAS
+   pour naviguer, **A** pour cocher, **X** pour tout cocher ou tout décocher,
+   **START** pour lancer. Le client affiche le nom reçu et suit — il n'a rien
+   à choisir, ce qui évite que les deux consoles comparent deux fichiers
+   différents.
+3. Pendant le transfert, une barre affiche le pourcentage et les octets
+   transférés, dans un sens comme dans l'autre (les deux barres apparaissent
+   en cas de conflit, puisque chaque console envoie sa copie à l'autre).
+4. À la fin, un récapitulatif liste chaque sauvegarde et son résultat, en
+   couleur : vert (`a jour`, `envoye`, `recu`), jaune (`conflit`), rouge
+   (`erreur`, `absent`). B annule à tout moment sans rien écrire.
 
 Si l'hôte choisit un jeu que l'autre console n'a pas, elle affiche « absent
 ici, il sera copié » et le reçoit comme nouveau fichier.
@@ -217,9 +224,9 @@ masquées.
   NiFi ; l'alternative serait un serveur Wi-Fi).
 - Un seul niveau de `.bak` : une deuxième synchro écrase la sauvegarde de
   secours précédente.
-- Environ 7 Ko/s (blocs de 128 octets, un par image) : compter une minute
-  pour une sauvegarde de 512 Ko. La marge sous la limite matérielle est
-  volontairement prudente et pourrait être remontée maintenant qu'un
-  transfert réel a abouti.
+- Environ 9,5 Ko/s (blocs de 160 octets, un par image) : compter 55 s
+  pour une sauvegarde de 512 Ko. Le paquet fait 180 octets, la limite utile
+  étant d'environ 215 : il reste de la marge, mais la gagner se paie en
+  robustesse si un paquet passe mal.
 - Le cas DSiWare (`.pub`/`.prv` transférés ensemble) est implémenté mais
   n'a jamais été testé sur du vrai matériel.

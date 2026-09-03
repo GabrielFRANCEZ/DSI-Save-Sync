@@ -28,11 +28,18 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SYNC_CHUNK_SIZE   128         // keeps SyncPkt at 148 bytes, see above
+// 160 keeps SyncPkt at 180 bytes. The client reply buffer is 256 bytes on the
+// wire, and the headers below it (Wifi_TxHeader 12 + IEEE_DataFrameHeader 24 +
+// AID 1 + checksum 4) leave roughly 215 usable, so this keeps ~35 bytes of
+// margin. Raising it further trades that margin for throughput; if a future
+// value is refused, Wifi_MultiplayerHostMode() now reports it on screen
+// instead of hanging, but recovering means reflashing both cards.
+#define SYNC_CHUNK_SIZE   160
 #define SYNC_GAME_ID      0x53415653u // 'SAVS', used to recognise our beacons
-#define SYNC_PROTO_VER    2
+#define SYNC_PROTO_VER    3
 #define SYNC_TIMEOUT_VBL  (60 * 20)   // ~20s with no progress -> give up
 #define SYNC_MODE_VBL     (60 * 5)    // ~5s for a wifi mode change
+#define SYNC_DRIFT_VBL    (60 * 15)   // ~15s of packets for another save -> give up
 
 #define PKT_CTRL 0
 #define PKT_DATA 1
@@ -43,7 +50,12 @@ typedef struct {
     u8  have_peer_meta;    // "I already have your metadata"
     u8  have_ack;
     u8  ack_file_idx;
-    u8  pad;
+    // Which save of the batch this packet belongs to, 1-based; 0 means the
+    // sender is idle between saves. Without it, a console that has moved on
+    // to the next save and one still finishing the previous one accept each
+    // other's packets, each resetting the other's timeout -- they hang
+    // forever instead of failing.
+    u8  save_index;
     u16 ack_seq;
 
     union {
@@ -51,7 +63,14 @@ typedef struct {
             u8  selection_valid;
             u8  selection_kind;
             u8  meta_valid;
-            u8  pad;
+            // Position of this save in the batch, 1-based (0 = the host hasn't
+            // chosen yet). The client uses it to tell "still announcing the
+            // save we just finished" from "moving on to the next one", which
+            // it couldn't do from the name alone.
+            u8  selection_index;
+            u8  batch_total;
+            u8  batch_done;   // the host is through the whole batch
+            u8  pad[2];
             char name[SAVE_NAME_MAX];
             SyncMeta meta;
         } ctrl;
@@ -117,11 +136,29 @@ static void tx_packet(bool is_host, const SyncPkt *pkt)
         Wifi_MultiplayerClientReplyTxFrame(pkt, sizeof(*pkt));
 }
 
-static void pkt_init(SyncPkt *out, u8 kind)
+// Le handler d'interruption ecrit s_rx_pkt sans se soucier de nous : sans
+// section critique, il peut le remplacer au milieu de notre copie et nous
+// livrer un paquet decousu (l'en-tete d'un paquet avec les donnees d'un
+// autre). Sur 180 octets recopies a chaque image, ca finit par arriver.
+static bool take_rx_packet(SyncPkt *dst)
+{
+    int old_ime = enterCriticalSection();
+    bool had = s_rx_pending;
+    if (had)
+    {
+        memcpy(dst, (const void *)&s_rx_pkt, sizeof(*dst));
+        s_rx_pending = false;
+    }
+    leaveCriticalSection(old_ime);
+    return had;
+}
+
+static void pkt_init(SyncPkt *out, u8 kind, int save_index)
 {
     memset(out, 0, sizeof(*out));
     out->proto_version = SYNC_PROTO_VER;
     out->kind = kind;
+    out->save_index = (u8)save_index;
 }
 
 // Waits for a wifi mode change without ever locking the console up: the user
@@ -173,21 +210,45 @@ static u32 chunks_for_len(u32 len)
 }
 
 // Does `a` need to push its data towards `b`? See file header comment.
+//
+// The first rule is the one that matters: a console can only send what it
+// actually holds. Comparing presence in both directions -- "a has it and b
+// doesn't" OR "b has it and a doesn't" -- made the console WITHOUT the save
+// believe it had to send. Its sender then found no file to open and declared
+// itself done immediately, which the other side read as "my peer gave up
+// while it still owed me data" and aborted the save on the spot, leaving the
+// receiver waiting for chunks that would never come.
 static bool decide_send(const SaveEntry *entry, const SyncMeta *a, const SyncMeta *b)
 {
+    int count;
+    const int *order = subfile_order(entry, &count);
+
+    bool a_has_something = false;
+    for (int i = 0; i < count; i++)
+    {
+        if (a->present[order[i]])
+            a_has_something = true;
+    }
+
+    // Nothing to offer. Note this also means a save deleted on one console is
+    // never propagated as a deletion: the other console keeps its copy.
+    if (!a_has_something)
+        return false;
+
     if (a->version < b->version)
         return false;
     if (a->version > b->version)
         return true;
 
-    int count;
-    const int *order = subfile_order(entry, &count);
+    // Same version: send if something we hold differs from what they hold.
     for (int i = 0; i < count; i++)
     {
         int sf = order[i];
-        if (a->present[sf] != b->present[sf])
+        if (!a->present[sf])
+            continue;
+        if (!b->present[sf])
             return true;
-        if (a->present[sf] && a->crc32[sf] != b->crc32[sf])
+        if (a->crc32[sf] != b->crc32[sf])
             return true;
     }
     return false;
@@ -622,7 +683,7 @@ int netsync_packet_size(void)
 void netsync_host_keepalive(const SaveEntry *entry)
 {
     SyncPkt out;
-    pkt_init(&out, PKT_CTRL);
+    pkt_init(&out, PKT_CTRL, 0);
 
     if (entry != NULL)
     {
@@ -635,10 +696,64 @@ void netsync_host_keepalive(const SaveEntry *entry)
     s_rx_pending = false;
 }
 
-bool netsync_client_wait_selection(char *name_out, int name_size,
-                                    SaveKind *kind_out, char *msg, int msg_size)
+void netsync_host_batch_finished(void)
+{
+    // Repeated because a single frame can be missed; the client only needs
+    // to see one of them to stop waiting.
+    for (int i = 0; i < 30; i++)
+    {
+        SyncPkt out;
+        pkt_init(&out, PKT_CTRL, 0);
+        out.u.ctrl.batch_done = 1;
+        tx_packet(true, &out);
+        swiWaitForVBlank();
+    }
+    s_rx_pending = false;
+}
+
+bool netsync_host_wait_peer_idle(char *msg, int msg_size)
 {
     int timeout = SYNC_TIMEOUT_VBL;
+
+    while (timeout-- > 0)
+    {
+        SyncPkt out;
+        pkt_init(&out, PKT_CTRL, 0);
+        tx_packet(true, &out);
+
+        swiWaitForVBlank();
+        scanKeys();
+        if (keysDown() & KEY_B)
+        {
+            snprintf(msg, msg_size, "Annule");
+            return false;
+        }
+
+        SyncPkt in;
+        if (take_rx_packet(&in))
+        {
+
+            // save_index 0 means the client is between saves, i.e. back in
+            // its "waiting for the next selection" loop.
+            if (in.proto_version == SYNC_PROTO_VER && in.save_index == 0)
+                return true;
+        }
+    }
+
+    snprintf(msg, msg_size, "L'autre console n'a pas\nfini la sauvegarde\nprecedente.");
+    return false;
+}
+
+bool netsync_client_wait_selection(char *name_out, int name_size,
+                                    SaveKind *kind_out, int *index_out,
+                                    int *total_out, bool *batch_done_out,
+                                    char *msg, int msg_size)
+{
+    int timeout = SYNC_TIMEOUT_VBL;
+
+    *batch_done_out = false;
+    *index_out = 0;
+    *total_out = 0;
 
     while (1)
     {
@@ -652,17 +767,15 @@ bool netsync_client_wait_selection(char *name_out, int name_size,
 
         // A client can only transmit in response to a host frame, so keep a
         // packet queued at all times.
+        // save_index 0 : "je suis disponible, entre deux sauvegardes".
         SyncPkt out;
-        pkt_init(&out, PKT_CTRL);
+        pkt_init(&out, PKT_CTRL, 0);
         tx_packet(false, &out);
 
-        if (s_rx_pending)
+        SyncPkt in;
+        if (take_rx_packet(&in))
         {
-            s_rx_pending = false;
             timeout = SYNC_TIMEOUT_VBL;
-
-            SyncPkt in;
-            memcpy(&in, (const void *)&s_rx_pkt, sizeof(in));
 
             if (in.proto_version != SYNC_PROTO_VER)
             {
@@ -670,11 +783,19 @@ bool netsync_client_wait_selection(char *name_out, int name_size,
                 return false;
             }
 
+            if (in.kind == PKT_CTRL && in.u.ctrl.batch_done)
+            {
+                *batch_done_out = true;
+                return true;
+            }
+
             if (in.kind == PKT_CTRL && in.u.ctrl.selection_valid)
             {
                 in.u.ctrl.name[SAVE_NAME_MAX - 1] = '\0';
                 snprintf(name_out, name_size, "%s", in.u.ctrl.name);
                 *kind_out = (SaveKind)in.u.ctrl.selection_kind;
+                *index_out = in.u.ctrl.selection_index;
+                *total_out = in.u.ctrl.batch_total;
                 return true;
             }
         }
@@ -688,8 +809,94 @@ bool netsync_client_wait_selection(char *name_out, int name_size,
 
 // --- step 3: compare and transfer ------------------------------------------
 
+// Builds the single packet we transmit this tick. Before both sides know
+// each other's metadata we send control packets (and the host keeps
+// announcing its selection); afterwards we send data packets, carrying a
+// chunk when we have one to push. Either way the packet also reports whether
+// we already hold the peer's metadata, and acks the last chunk we received --
+// those two fields live outside the union precisely so they ride along in
+// both phases.
+static void build_outgoing(SyncPkt *out, bool is_host, bool decided,
+                            const SaveEntry *entry, const SyncMeta *local_meta,
+                            SenderState *sender, const ReceiverState *receiver,
+                            bool have_peer_meta, int batch_index, int batch_total)
+{
+    if (!decided)
+    {
+        // Metadata exchange. We keep sending ours until they confirm they
+        // have it, so a single lost packet can't stall the session.
+        pkt_init(out, PKT_CTRL, batch_index);
+        out->u.ctrl.meta_valid = 1;
+        out->u.ctrl.meta = *local_meta;
+        if (is_host)
+        {
+            out->u.ctrl.selection_valid = 1;
+            out->u.ctrl.selection_kind = (u8)entry->kind;
+            out->u.ctrl.selection_index = (u8)batch_index;
+            out->u.ctrl.batch_total = (u8)batch_total;
+            snprintf(out->u.ctrl.name, SAVE_NAME_MAX, "%s", entry->display_name);
+        }
+    }
+    else
+    {
+        pkt_init(out, PKT_DATA, batch_index);
+        if (!sender_fill(sender, entry, local_meta, out))
+            out->u.data.done = sender->done;
+    }
+
+    out->have_peer_meta = have_peer_meta ? 1 : 0;
+
+    if (receiver->have_ack)
+    {
+        out->have_ack = 1;
+        out->ack_file_idx = receiver->ack_file_idx;
+        out->ack_seq = receiver->ack_seq;
+    }
+}
+
+// Bytes already transferred for the sub-file in flight. Stop-and-wait means
+// the sequence number doubles as a byte counter, capped so the last (short)
+// chunk doesn't report more than the file actually holds.
+static u32 bytes_from_seq(u32 seq, u32 total_len)
+{
+    u32 done = seq * SYNC_CHUNK_SIZE;
+    return (done > total_len) ? total_len : done;
+}
+
+static void report_progress(SyncProgressFn on_progress, bool decided,
+                             const SenderState *sender, const ReceiverState *receiver,
+                             const SyncMeta *local_meta, const SyncMeta *peer_meta,
+                             bool have_peer_meta, int peer_index, int idle_frames)
+{
+    if (on_progress == NULL)
+        return;
+
+    SyncProgress p;
+    memset(&p, 0, sizeof(p));
+    p.phase = decided ? SYNC_PHASE_TRANSFER : SYNC_PHASE_HANDSHAKE;
+    p.peer_index = peer_index;
+    p.idle_frames = idle_frames;
+
+    if (decided && sender->active && !sender->done && sender->order_pos >= 0)
+    {
+        p.sending = true;
+        p.sent_total = local_meta->len[sender->cur_file_idx];
+        p.sent_done = bytes_from_seq(sender->cur_seq, p.sent_total);
+    }
+
+    if (decided && receiver->expect && have_peer_meta && receiver->cur_file_idx >= 0)
+    {
+        p.receiving = true;
+        p.recv_total = peer_meta->len[receiver->cur_file_idx];
+        p.recv_done = bytes_from_seq(receiver->expected_seq, p.recv_total);
+    }
+
+    on_progress(&p);
+}
+
 SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_meta,
-                         char *msg, int msg_size)
+                         int batch_index, int batch_total,
+                         SyncProgressFn on_progress, char *msg, int msg_size)
 {
     s_rx_pending = false;
 
@@ -706,6 +913,10 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
     receiver_start(&receiver, entry, RMODE_NONE, false);
 
     int timeout = SYNC_TIMEOUT_VBL;
+    int finishing = 0; // frames spent transmitting our final ack before leaving
+    int drift = 0;     // consecutive packets belonging to another save
+    int peer_index = -1;  // save index seen on the last packet, for diagnostics
+    int idle_frames = 0;  // frames since a packet meant for this save
     bool version_mismatch = false;
 
     while (1)
@@ -722,47 +933,15 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
 
         // --- build and send our packet for this tick ---
         SyncPkt out;
-
-        if (!decided)
-        {
-            // Metadata exchange. We keep sending ours until they confirm they
-            // have it, so a single lost packet can't stall the session.
-            pkt_init(&out, PKT_CTRL);
-            out.u.ctrl.meta_valid = 1;
-            out.u.ctrl.meta = *local_meta;
-            if (is_host)
-            {
-                out.u.ctrl.selection_valid = 1;
-                out.u.ctrl.selection_kind = (u8)entry->kind;
-                snprintf(out.u.ctrl.name, SAVE_NAME_MAX, "%s", entry->display_name);
-            }
-        }
-        else
-        {
-            pkt_init(&out, PKT_DATA);
-            if (!sender_fill(&sender, entry, local_meta, &out))
-                out.u.data.done = sender.done;
-        }
-
-        out.have_peer_meta = have_peer_meta ? 1 : 0;
-
-        if (receiver.have_ack)
-        {
-            out.have_ack = 1;
-            out.ack_file_idx = receiver.ack_file_idx;
-            out.ack_seq = receiver.ack_seq;
-        }
-
+        build_outgoing(&out, is_host, decided, entry, local_meta,
+                        &sender, &receiver, have_peer_meta,
+                        batch_index, batch_total);
         tx_packet(is_host, &out);
 
         // --- process what the peer sent this tick ---
-        if (s_rx_pending)
+        SyncPkt in;
+        if (take_rx_packet(&in))
         {
-            s_rx_pending = false;
-            timeout = SYNC_TIMEOUT_VBL;
-
-            SyncPkt in;
-            memcpy(&in, (const void *)&s_rx_pkt, sizeof(in));
 
             if (in.proto_version != SYNC_PROTO_VER)
             {
@@ -770,15 +949,45 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
                 break;
             }
 
-            if (in.have_peer_meta)
+            bool for_us = (in.save_index == batch_index);
+
+            // Only a packet about OUR save proves the peer is still working
+            // with us. Resetting the timeout on any packet at all is what
+            // froze both consoles: the peer had moved on and was sending
+            // packets about something else -- or nothing at all -- and each
+            // one bought us another 20 seconds, forever.
+            peer_index = in.save_index;
+
+            if (for_us)
+            {
+                timeout = SYNC_TIMEOUT_VBL;
+                drift = 0;
+                idle_frames = 0;
+            }
+            else if (++drift > SYNC_DRIFT_VBL)
+            {
+                sender_close(&sender);
+                receiver_close(&receiver);
+                snprintf(msg, msg_size, in.save_index == 0
+                         ? "L'autre console a abandonne\ncette sauvegarde."
+                         : "Les deux consoles ne sont\npas sur la meme sauvegarde.\nRelance la synchro.");
+                return SYNC_RESULT_ERROR;
+            }
+
+            if (for_us && in.have_peer_meta)
                 peer_has_my_meta = true;
 
-            if (in.kind == PKT_CTRL && in.u.ctrl.meta_valid)
+            // Only before the decision. Afterwards peer_meta is what we check
+            // the received CRCs against, and what we copy into our own sidecar
+            // -- and in a batch the host may already be announcing the NEXT
+            // save while we finish this one, so accepting its metadata here
+            // would attribute the wrong version and CRC to this save.
+            if (for_us && in.kind == PKT_CTRL && in.u.ctrl.meta_valid && !decided)
             {
                 peer_meta = in.u.ctrl.meta;
                 have_peer_meta = true;
             }
-            else if (in.kind == PKT_DATA)
+            else if (for_us && in.kind == PKT_DATA)
             {
                 if (in.u.data.done)
                     peer_send_done = true;
@@ -791,7 +1000,7 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
                 }
             }
 
-            if (in.have_ack)
+            if (for_us && in.have_ack)
                 sender_on_ack(&sender, in.ack_file_idx, in.ack_seq);
         }
         else if (--timeout <= 0)
@@ -801,6 +1010,8 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
             snprintf(msg, msg_size, "L'autre console ne repond plus");
             return SYNC_RESULT_NO_PEER;
         }
+
+        idle_frames++;
 
         // Both sides have each other's metadata: decide who sends what.
         if (!decided && have_peer_meta && peer_has_my_meta)
@@ -826,8 +1037,35 @@ SyncResult netsync_sync(bool is_host, const SaveEntry *entry, SyncMeta *local_me
             decided = true;
         }
 
-        if (decided && sender.done && peer_send_done && receiver_all_done(&receiver))
-            break;
+        report_progress(on_progress, decided, &sender, &receiver,
+                         local_meta, &peer_meta, have_peer_meta,
+                         peer_index, idle_frames);
+
+        // The peer says it has nothing left to push, but we're still short of
+        // what its metadata promised: waiting longer would just burn the
+        // timeout, so fail now with something the user can act on.
+        if (decided && peer_send_done && !receiver_all_done(&receiver))
+        {
+            sender_close(&sender);
+            receiver_close(&receiver);
+            snprintf(msg, msg_size, "Transfert incomplet.\nRien n'a ete modifie.");
+            return SYNC_RESULT_ERROR;
+        }
+
+        // Exit on our own state only. Waiting for the peer's "done" flag as
+        // well used to deadlock: whichever side finished first left the data
+        // phase, and from then on it only sent control packets, so the other
+        // side waited for a flag that could never arrive.
+        if (decided && sender.done && receiver_all_done(&receiver))
+        {
+            // Keep transmitting for a few frames before leaving. Our packet
+            // is built before the peer's is processed, so the ack for the
+            // last chunk we received is still sitting in our outgoing packet
+            // -- leaving immediately would strand the peer's sender one chunk
+            // short of finishing.
+            if (++finishing >= 6)
+                break;
+        }
     }
 
     sender_close(&sender);
